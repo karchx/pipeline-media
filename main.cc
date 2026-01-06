@@ -76,6 +76,10 @@ public:
         };
     }
 
+    void decoder_webm() {
+
+    }
+
     void decoder(WebPData web_data) {
         Frame frame;
         WebPAnimDecoderOptions dec_options;
@@ -125,7 +129,7 @@ public:
         WebPAnimDecoderDelete(dec);
     }
 
-    void encoder(std::queue<Frame> &frames, std::string output_file) {
+    void encoder_mp4(std::queue<Frame> &frames, std::string output_file) {
         if (frames.empty()) return;
         Frame first_frame = frames.front();
         int canvas_width = first_frame.width;
@@ -295,6 +299,13 @@ public:
         avformat_free_context(fmt_ctx);
     }
 
+    void remuxing_to_mp4(const std::string &input_file) {
+        AVFormatContext *input_ctx = nullptr, *output_ctx = nullptr;
+        std::string output_file = input_file;
+        generate_output_filename(output_file);
+        encoder_mp4(frames, input_file);
+    }
+
     bool process_webp_to_mp4(const std::string &input_file) {
         auto data = read_file(input_file.c_str());
         if (data.empty()) {
@@ -302,9 +313,9 @@ public:
             return false;
         }
         WebPData webp_data = { data.data(), static_cast<size_t>(data.size()) };
-
-        decoder(webp_data);
-        encoder(frames, input_file);
+        remuxing_to_mp4(input_file);
+        // decoder(webp_data);
+        // encoder(frames, input_file);
 
         return true;
     }
@@ -314,7 +325,7 @@ int main() {
     PipeConversionManager manager;
     // manager.add_task("input.webp");
     // manager.add_task("input2.webp");
-    manager.add_task("test.webp");
+    manager.add_task("test.webm");
 
     const int num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> pool;
