@@ -76,8 +76,212 @@ public:
         };
     }
 
-    void decoder_webm() {
+    bool decoder_webm(std::string input_file) {
+        AVFormatContext *fmt_ctx = nullptr;
+        AVCodecContext *codec_ctx = nullptr;
+        AVFrame *av_frame = nullptr;
+        AVFrame *rgba_frame = nullptr;
+        AVPacket *pkt = nullptr;
+        SwsContext *sws_ctx = nullptr;
+        int video_stream_index = -1;
+        int audio_stream_index = -1;
+        // added input audio stream
 
+        if (avformat_open_input(&fmt_ctx, input_file.c_str(), nullptr, nullptr) < 0) {
+            log("Could not open input file: " + input_file);
+            return false;
+        }
+
+        if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+            log("Could not find stream information");
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
+            if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                video_stream_index = i;
+                break;
+            } else if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                audio_stream_index = i;
+            }
+        }
+
+        if (video_stream_index == -1) {
+            log("Could not find video stream in the input file");
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        AVStream *video_stream = fmt_ctx->streams[video_stream_index];
+
+        const AVCodec *codec = avcodec_find_decoder(video_stream->codecpar->codec_id);
+        if (!codec) {
+            log("Could not find decoder");
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        codec_ctx = avcodec_alloc_context3(codec);
+        if (!codec_ctx) {
+            log("Could not allocate codec context");
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        // Copy codec parameters to context
+        if (avcodec_parameters_to_context(codec_ctx, video_stream->codecpar) < 0) {
+            log("Could not copy codec parameters to context");
+            avcodec_free_context(&codec_ctx);
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+            log("Could not open codec");
+            avcodec_free_context(&codec_ctx);
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        av_frame = av_frame_alloc();
+        rgba_frame = av_frame_alloc();
+        pkt = av_packet_alloc();
+
+        if (!av_frame || !rgba_frame || !pkt) {
+            log("Could not allocate frames or packet");
+            return false;
+        }
+
+        rgba_frame->format = AV_PIX_FMT_RGBA;
+        rgba_frame->width = codec_ctx->width;
+        rgba_frame->height = codec_ctx->height;
+        rgba_frame->sample_rate = codec_ctx->sample_rate;
+
+        if (av_image_alloc(rgba_frame->data, rgba_frame->linesize, rgba_frame->width, rgba_frame->height, AV_PIX_FMT_RGBA, 32) < 0) {
+            log("Could not allocate RGBA image");
+            return false;
+        }
+
+        sws_ctx = sws_getContext(
+            codec_ctx->width,
+            codec_ctx->height,
+            codec_ctx->pix_fmt,
+            codec_ctx->width,
+            codec_ctx->height,
+            AV_PIX_FMT_RGBA,
+            SWS_BILINEAR,
+            nullptr,
+            nullptr,
+            nullptr
+        );
+
+        if (!sws_ctx) {
+            log("Could not initialize SwsContext");
+            return false;
+        }
+
+        AVRational time_base = video_stream->time_base;
+        int64_t prev_pts = 0;
+        bool first_frame = true;
+
+        while (av_read_frame(fmt_ctx, pkt) >= 0) {
+            if (pkt->stream_index == video_stream_index) {
+                if (avcodec_send_packet(codec_ctx, pkt) >= 0) {
+                    while (avcodec_receive_frame(codec_ctx, av_frame) == 0) {
+                        sws_scale(
+                            sws_ctx,
+                            av_frame->data,
+                            av_frame->linesize,
+                            0,
+                            codec_ctx->height,
+                            rgba_frame->data,
+                            rgba_frame->linesize
+                        );
+
+                        int64_t current_pts = av_frame->pts;
+                        int duration_ms = 0;
+
+                        if (first_frame) {
+                            if (video_stream->avg_frame_rate.num > 0) {
+                                duration_ms = (1000 * video_stream->avg_frame_rate.den) / video_stream->avg_frame_rate.num;
+                            } else {
+                                duration_ms = 33;
+                            }
+                            first_frame = false;
+                        } else {
+                            int64_t pts_diff = current_pts - prev_pts;
+                            duration_ms = av_rescale_q(pts_diff, time_base, {1, 1000});
+                            if (duration_ms <= 0) duration_ms = 33;
+                        }
+
+                        prev_pts = current_pts;
+
+                        Frame frame;
+                        frame.width = codec_ctx->width;
+                        frame.height = codec_ctx->height;
+                        frame.duration_ms = duration_ms;
+
+                        size_t data_size = codec_ctx->width * codec_ctx->height * 4;
+                        frame.data.resize(data_size);
+
+                        for (int y = 0; y < codec_ctx->height; ++y) {
+                            std::memcpy(
+                                frame.data.data() + y * codec_ctx->width * 4,
+                                rgba_frame->data[0] + y * rgba_frame->linesize[0],
+                                codec_ctx->width * 4
+                            );
+                        }
+
+                        frames.push(frame);
+                    }
+                }
+            }
+            av_packet_unref(pkt);
+        }
+
+        avcodec_send_packet(codec_ctx, nullptr);
+        while (avcodec_receive_frame(codec_ctx, av_frame) == 0) {
+            sws_scale(
+                sws_ctx,
+                av_frame->data,
+                av_frame->linesize,
+                0,
+                codec_ctx->height,
+                rgba_frame->data,
+                rgba_frame->linesize
+            );
+
+            Frame frame;
+            frame.width = codec_ctx->width;
+            frame.height = codec_ctx->height;
+            frame.duration_ms = 33;
+
+            size_t data_size = codec_ctx->width * codec_ctx->height * 4;
+            frame.data.resize(data_size);
+
+            for (int y = 0; y < codec_ctx->width; ++y) {
+                std::memcpy(
+                    frame.data.data() + y * codec_ctx->width * 4,
+                    rgba_frame->data[0] + y * rgba_frame->linesize[0],
+                    codec_ctx->width * 4
+                );
+            }
+
+            frames.push(frame);
+        }
+
+        if (rgba_frame) {
+            av_freep(&rgba_frame->data[0]);
+            av_frame_free(&rgba_frame);
+        }
+        if (av_frame) av_frame_free(&av_frame);
+        if (pkt) av_packet_free(&pkt);
+        if (sws_ctx) sws_freeContext(sws_ctx);
+        if (codec_ctx) avcodec_free_context(&codec_ctx);
+        if (fmt_ctx) avformat_close_input(&fmt_ctx);
+
+        return !frames.empty();
     }
 
     void decoder(WebPData web_data) {
@@ -176,7 +380,7 @@ public:
         }
 
         AVDictionary *opts = nullptr;
-        av_dict_set(&opts, "preset", "slow", 0);
+        av_dict_set(&opts, "pt", "slow", 0);
         av_dict_set(&opts, "crf", "23", 0);
 
         if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
@@ -307,15 +511,22 @@ public:
     }
 
     bool process_webp_to_mp4(const std::string &input_file) {
-        auto data = read_file(input_file.c_str());
-        if (data.empty()) {
-            log("Failed to read file: " + input_file);
-            return false;
-        }
-        WebPData webp_data = { data.data(), static_cast<size_t>(data.size()) };
-        remuxing_to_mp4(input_file);
+        // auto data = read_file(input_file.c_str());
+        // if (data.empty()) {
+        //     log("Failed to read file: " + input_file);
+        //     return false;
+        // }
+        // WebPData webp_data = { data.data(), static_cast<size_t>(data.size()) };
+        // remuxing_to_mp4(input_file);
         // decoder(webp_data);
         // encoder(frames, input_file);
+        //
+        if (decoder_webm(input_file)) {
+            encoder_mp4(frames, input_file);
+        } else {
+            log("Failed to decode webm file: " + input_file);
+            return false;
+        }
 
         return true;
     }
