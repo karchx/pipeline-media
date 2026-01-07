@@ -45,6 +45,68 @@ private:
         input_filename.append(".mp4");
     }
 
+    void decode_video(
+        AVCodecContext *codec_ctx,
+        AVPacket *pkt,
+        AVFrame *av_frame,
+        AVFrame *rgba_frame,
+        AVStream *video_stream,
+        SwsContext *sws_ctx
+    ) {
+        AVRational time_base = video_stream->time_base;
+        int64_t prev_pts = 0;
+        bool first_frame = true;
+        if (avcodec_send_packet(codec_ctx, pkt) >= 0) {
+            while (avcodec_receive_frame(codec_ctx, av_frame) == 0) {
+                sws_scale(
+                    sws_ctx,
+                    av_frame->data,
+                    av_frame->linesize,
+                    0,
+                    codec_ctx->height,
+                    rgba_frame->data,
+                    rgba_frame->linesize
+                );
+
+                int64_t current_pts = av_frame->pts;
+                int duration_ms = 0;
+
+                if (first_frame) {
+                    if (video_stream->avg_frame_rate.num > 0) {
+                        duration_ms = (1000 * video_stream->avg_frame_rate.den) / video_stream->avg_frame_rate.num;
+                    } else {
+                        duration_ms = 33;
+                    }
+                    first_frame = false;
+                } else {
+                    int64_t pts_diff = current_pts - prev_pts;
+                    duration_ms = av_rescale_q(pts_diff, time_base, {1, 1000});
+                    if (duration_ms <= 0) duration_ms = 33;
+                }
+
+                prev_pts = current_pts;
+
+                Frame frame;
+                frame.width = codec_ctx->width;
+                frame.height = codec_ctx->height;
+                frame.duration_ms = duration_ms;
+
+                size_t data_size = codec_ctx->width * codec_ctx->height * 4;
+                frame.data.resize(data_size);
+
+                for (int y = 0; y < codec_ctx->height; ++y) {
+                    std::memcpy(
+                        frame.data.data() + y * codec_ctx->width * 4,
+                        rgba_frame->data[0] + y * rgba_frame->linesize[0],
+                        codec_ctx->width * 4
+                    );
+                }
+
+                frames.push(frame);
+            }
+        }
+    }
+
 public:
     void add_task(const std::string &filename) {
         tasks.push(filename);
@@ -181,61 +243,9 @@ public:
             return false;
         }
 
-        AVRational time_base = video_stream->time_base;
-        int64_t prev_pts = 0;
-        bool first_frame = true;
-
         while (av_read_frame(fmt_ctx, pkt) >= 0) {
             if (pkt->stream_index == video_stream_index) {
-                if (avcodec_send_packet(codec_ctx, pkt) >= 0) {
-                    while (avcodec_receive_frame(codec_ctx, av_frame) == 0) {
-                        sws_scale(
-                            sws_ctx,
-                            av_frame->data,
-                            av_frame->linesize,
-                            0,
-                            codec_ctx->height,
-                            rgba_frame->data,
-                            rgba_frame->linesize
-                        );
-
-                        int64_t current_pts = av_frame->pts;
-                        int duration_ms = 0;
-
-                        if (first_frame) {
-                            if (video_stream->avg_frame_rate.num > 0) {
-                                duration_ms = (1000 * video_stream->avg_frame_rate.den) / video_stream->avg_frame_rate.num;
-                            } else {
-                                duration_ms = 33;
-                            }
-                            first_frame = false;
-                        } else {
-                            int64_t pts_diff = current_pts - prev_pts;
-                            duration_ms = av_rescale_q(pts_diff, time_base, {1, 1000});
-                            if (duration_ms <= 0) duration_ms = 33;
-                        }
-
-                        prev_pts = current_pts;
-
-                        Frame frame;
-                        frame.width = codec_ctx->width;
-                        frame.height = codec_ctx->height;
-                        frame.duration_ms = duration_ms;
-
-                        size_t data_size = codec_ctx->width * codec_ctx->height * 4;
-                        frame.data.resize(data_size);
-
-                        for (int y = 0; y < codec_ctx->height; ++y) {
-                            std::memcpy(
-                                frame.data.data() + y * codec_ctx->width * 4,
-                                rgba_frame->data[0] + y * rgba_frame->linesize[0],
-                                codec_ctx->width * 4
-                            );
-                        }
-
-                        frames.push(frame);
-                    }
-                }
+                decode_video(codec_ctx, pkt, av_frame, rgba_frame, video_stream, sws_ctx);
             }
             av_packet_unref(pkt);
         }
