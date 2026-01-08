@@ -13,6 +13,8 @@ extern "C" {
     #include <libavutil/imgutils.h>
     #include <libswscale/swscale.h>
     #include <libavutil/dict.h>
+    #include <libavutil/opt.h>
+    #include <libswresample/swresample.h>
     #include <libavcodec/packet.h>
 }
 
@@ -23,12 +25,21 @@ struct Frame {
     int duration_ms;
 };
 
+struct AudioFrame {
+    std::vector<uint8_t> data;
+    int64_t pts;
+    int nb_samples;
+    int sample_rate;
+    int channels;
+};
+
 class PipeConversionManager {
 private:
     std::string file;
     std::mutex mtx;
     std::queue<std::string> tasks;
     std::queue<Frame> frames;
+    std::queue<AudioFrame> audio_frames;
 
     void log(const std::string &message) {
         std::lock_guard<std::mutex> lock(mtx);
@@ -107,6 +118,52 @@ private:
         }
     }
 
+    void decode_audio(
+        AVCodecContext *audio_codec_ctx,
+        AVPacket *pkt,
+        AVFrame *audio_frame,
+        AVStream *audio_stream,
+        SwrContext *swr_ctx
+    ) {
+        if (avcodec_send_packet(audio_codec_ctx, pkt) >= 0) {
+            while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                AudioFrame frame;
+                frame.pts = audio_frame->pts;
+                frame.nb_samples = audio_frame->nb_samples;
+                frame.sample_rate = audio_codec_ctx->sample_rate;
+                frame.channels = audio_codec_ctx->ch_layout.nb_channels;
+
+                int out_samples = audio_frame->nb_samples;
+                int out_channels = audio_codec_ctx->ch_layout.nb_channels;
+                int out_sample_rate = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+
+                size_t data_size = out_samples * out_channels * out_sample_rate;
+                frame.data.resize(data_size);
+
+                uint8_t *out_buf = frame.data.data();
+
+                if(swr_ctx) {
+                    swr_convert(
+                        swr_ctx,
+                        &out_buf,
+                        out_samples,
+                        (const uint8_t **)audio_frame->data,
+                        audio_frame->nb_samples
+                    );
+                } else {
+                    av_samples_copy(
+                        &out_buf,
+                        audio_frame->data,
+                        0, 0,
+                        audio_frame->nb_samples,
+                        out_channels,
+                        AV_SAMPLE_FMT_S16
+                    );
+                }
+            }
+        }
+    }
+
 public:
     void add_task(const std::string &filename) {
         tasks.push(filename);
@@ -146,8 +203,12 @@ public:
         AVPacket *pkt = nullptr;
         SwsContext *sws_ctx = nullptr;
         int video_stream_index = -1;
+
+        // input audio stream
         int audio_stream_index = -1;
-        // added input audio stream
+        AVFrame *audio_frame = nullptr;
+        AVCodecContext *audio_codec_ctx = nullptr;
+        SwrContext *swr_ctx = nullptr;
 
         if (avformat_open_input(&fmt_ctx, input_file.c_str(), nullptr, nullptr) < 0) {
             log("Could not open input file: " + input_file);
@@ -163,7 +224,6 @@ public:
         for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
             if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 video_stream_index = i;
-                break;
             } else if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
                 audio_stream_index = i;
             }
@@ -176,6 +236,7 @@ public:
         }
 
         AVStream *video_stream = fmt_ctx->streams[video_stream_index];
+        AVStream *audio_stream = fmt_ctx->streams[audio_stream_index];
 
         const AVCodec *codec = avcodec_find_decoder(video_stream->codecpar->codec_id);
         if (!codec) {
@@ -206,8 +267,33 @@ public:
             return false;
         }
 
+        const AVCodec *audio_codec = avcodec_find_decoder(audio_stream->codecpar->codec_id);
+
+        audio_codec_ctx = avcodec_alloc_context3(audio_codec);
+        if (!audio_codec_ctx) {
+            log("Could not allocate codec context");
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        // Copy codec parameters to context
+        if (avcodec_parameters_to_context(audio_codec_ctx, audio_stream->codecpar) < 0) {
+            log("Could not copy codec parameters to context audio");
+            avcodec_free_context(&audio_codec_ctx);
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
+        if (avcodec_open2(audio_codec_ctx, audio_codec, nullptr) < 0) {
+            log("Could not open codec audio");
+            avcodec_free_context(&audio_codec_ctx);
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+
         av_frame = av_frame_alloc();
         rgba_frame = av_frame_alloc();
+        audio_frame = av_frame_alloc();
         pkt = av_packet_alloc();
 
         if (!av_frame || !rgba_frame || !pkt) {
@@ -218,7 +304,6 @@ public:
         rgba_frame->format = AV_PIX_FMT_RGBA;
         rgba_frame->width = codec_ctx->width;
         rgba_frame->height = codec_ctx->height;
-        rgba_frame->sample_rate = codec_ctx->sample_rate;
 
         if (av_image_alloc(rgba_frame->data, rgba_frame->linesize, rgba_frame->width, rgba_frame->height, AV_PIX_FMT_RGBA, 32) < 0) {
             log("Could not allocate RGBA image");
@@ -243,42 +328,23 @@ public:
             return false;
         }
 
+        // swr_ctx for audio
+        swr_ctx = swr_alloc();
+        av_opt_set_chlayout(swr_ctx, "in_chlayout", &audio_codec_ctx->ch_layout, 0);
+        av_opt_set_chlayout(swr_ctx, "out_chlayout", &audio_codec_ctx->ch_layout, 0);
+        av_opt_set_int(swr_ctx, "in_sample_rate", audio_codec_ctx->sample_rate, 0);
+        av_opt_set_int(swr_ctx, "out_sample_rate", audio_codec_ctx->sample_rate, 0);
+        av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", audio_codec_ctx->sample_fmt, 0);
+        av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+        swr_init(swr_ctx);
+
         while (av_read_frame(fmt_ctx, pkt) >= 0) {
             if (pkt->stream_index == video_stream_index) {
                 decode_video(codec_ctx, pkt, av_frame, rgba_frame, video_stream, sws_ctx);
+            } else if (pkt->stream_index == audio_stream_index) {
+                decode_audio(audio_codec_ctx, pkt, audio_frame, audio_stream, swr_ctx);
             }
             av_packet_unref(pkt);
-        }
-
-        avcodec_send_packet(codec_ctx, nullptr);
-        while (avcodec_receive_frame(codec_ctx, av_frame) == 0) {
-            sws_scale(
-                sws_ctx,
-                av_frame->data,
-                av_frame->linesize,
-                0,
-                codec_ctx->height,
-                rgba_frame->data,
-                rgba_frame->linesize
-            );
-
-            Frame frame;
-            frame.width = codec_ctx->width;
-            frame.height = codec_ctx->height;
-            frame.duration_ms = 33;
-
-            size_t data_size = codec_ctx->width * codec_ctx->height * 4;
-            frame.data.resize(data_size);
-
-            for (int y = 0; y < codec_ctx->width; ++y) {
-                std::memcpy(
-                    frame.data.data() + y * codec_ctx->width * 4,
-                    rgba_frame->data[0] + y * rgba_frame->linesize[0],
-                    codec_ctx->width * 4
-                );
-            }
-
-            frames.push(frame);
         }
 
         if (rgba_frame) {
@@ -290,6 +356,8 @@ public:
         if (sws_ctx) sws_freeContext(sws_ctx);
         if (codec_ctx) avcodec_free_context(&codec_ctx);
         if (fmt_ctx) avformat_close_input(&fmt_ctx);
+        if (audio_codec_ctx) avcodec_free_context(&audio_codec_ctx);
+        if (swr_ctx) swr_free(&swr_ctx);
 
         return !frames.empty();
     }
@@ -511,13 +579,6 @@ public:
         avio_closep(&fmt_ctx->pb);
         avcodec_free_context(&codec_ctx);
         avformat_free_context(fmt_ctx);
-    }
-
-    void remuxing_to_mp4(const std::string &input_file) {
-        AVFormatContext *input_ctx = nullptr, *output_ctx = nullptr;
-        std::string output_file = input_file;
-        generate_output_filename(output_file);
-        encoder_mp4(frames, input_file);
     }
 
     bool process_webp_to_mp4(const std::string &input_file) {
